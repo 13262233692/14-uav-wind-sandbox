@@ -4,6 +4,21 @@
 #include "Math/Vector.h"
 #include "Math/Quat.h"
 #include "Physics/RigidBody6DOF.h"
+#include "HAL/PlatformMath.h"
+
+#define UAV_AERO_MIN_AIRSPEED      0.5f
+#define UAV_AERO_EPSILON           1e-7f
+#define UAV_AERO_MAX_CL            3.0f
+#define UAV_AERO_MIN_CL           -1.5f
+#define UAV_AERO_MAX_CD            1.5f
+#define UAV_AERO_MAX_CM            2.0f
+#define UAV_AERO_MAX_BETA_DEG      45.0f
+#define UAV_AERO_MAX_ALPHA_DEG     90.0f
+#define UAV_AERO_MAX_AIRSPEED      350.0f
+#define UAV_AERO_MAX_DYNPRESSURE   100000.0f
+#define UAV_AERO_MAX_FLUTTER_AMP   1.0f
+#define UAV_AERO_MAX_TORQUE        5000.0f
+#define UAV_AERO_MAX_FORCE         50000.0f
 
 struct FWingSection
 {
@@ -42,6 +57,14 @@ struct FAircraftConfig
 	float  CdMin                = 0.015f;
 };
 
+enum class EAeroSolverHealth : uint8
+{
+	Healthy          = 0,
+	InputClamped     = 1,
+	OutputClamped    = 2,
+	EmergencyClamped = 3
+};
+
 class UAVWINDSANDBOX_API FAerodynamicsSolver
 {
 public:
@@ -69,6 +92,10 @@ public:
 	float   GetDragCoefficient() const { return CD; }
 	float   GetFlutterAmplitude() const { return FlutterAmplitude; }
 
+	EAeroSolverHealth GetHealth() const { return Health; }
+	int32 GetTotalEmergencyClamps() const { return EmergencyClampCount; }
+	void ResetHealth();
+
 private:
 	FAircraftConfig Aircraft;
 
@@ -92,20 +119,36 @@ private:
 	float   TorsionVelocity    = 0.0f;
 	float   FlutterTimeAccum   = 0.0f;
 
+	EAeroSolverHealth Health = EAeroSolverHealth::Healthy;
+	int32 EmergencyClampCount = 0;
+
 	void ComputeAirspeedAndAngles(
 		const FVector& WorldVelocity,
 		const FQuat&   BodyOrientation
 	);
 
 	void ComputeLiftDragCoefficients();
-	void ComputeStabilityDerivatives();
+	void ComputeStabilityDerivatives(float b, float c, float S);
 	void ComputeFlutterForces(float DeltaTime, float AirDensity);
 
 	FVector ComputeLiftVector_Body() const;
 	FVector ComputeDragVector_Body() const;
 	FVector ComputeSideforceVector_Body() const;
-	FVector ComputeMomentVector_Body() const;
+	FVector ComputeMomentVector_Body(float b, float c, float S, float Q) const;
 
 	FVector BodyForcesToWorld(const FVector& BodyForce, const FQuat& Orientation) const;
 	FVector BodyTorquesToWorld(const FVector& BodyTorque, const FQuat& Orientation) const;
+
+	bool ValidateInputVector(const FVector& V) const;
+	bool ValidateFloat(float Val) const;
+
+	float SafeDivide(float Numerator, float Denominator, float Default = 0.0f) const;
+	float SafeAsin(float X) const;
+	float SafeAcos(float X) const;
+
+	void ClampInput(FVector& Velocity, float& AirDensity, float& DeltaTime);
+	void ClampCoefficients();
+	void ClampForceResult(FAeroForceResult& Result) const;
+
+	void MarkHealth(EAeroSolverHealth NewHealth);
 };

@@ -4,6 +4,8 @@
 #include "DrawDebugHelpers.h"
 #include "EnhancedInputComponent.h"
 #include "InputActionValue.h"
+#include "Engine/World.h"
+#include "Engine/Engine.h"
 
 ASolarUAV::ASolarUAV()
 {
@@ -57,6 +59,12 @@ void ASolarUAV::InitializePhysics()
 	SimElapsed = 0.0f;
 	PhysicsAccumulator = 0.0f;
 	bInitialized = true;
+	bEmergencyStopped = false;
+	SystemHealth = EUAVSystemHealth::Healthy;
+	ConsecutiveRecoveries = 0;
+	TotalEmergencyRecoveries = 0;
+	TotalAeroEmergencyClamps = 0;
+	LastHealthMessage = TEXT("System initialized");
 }
 
 void ASolarUAV::SetControlSurfaces(float Aileron, float Elevator, float Rudder, float Thr)
@@ -99,7 +107,7 @@ void ASolarUAV::ApplyControlSurfaceForces()
 	RigidBody.AddForce_World(ThrustDir_World * ThrustMag);
 }
 
-void ASolarUAV::FixedPhysicsTick(float FixedDt)
+void ASolarUAV::ComputeAndApplyAerodynamics(float StepTime)
 {
 	FVector UAVWorldPos = RigidBody.GetWorldPosition();
 
@@ -112,44 +120,123 @@ void ASolarUAV::FixedPhysicsTick(float FixedDt)
 	FQuat BodyOrientation = RigidBody.GetWorldOrientation();
 	FVector AngVelocity = RigidBody.GetAngularVelocity();
 
-	LastAeroResult = AeroSolver.ComputeAerodynamicForces(
+	FAeroForceResult AeroResult = AeroSolver.ComputeAerodynamicForces(
 		RelativeAirspeed,
 		AngVelocity,
 		BodyOrientation,
 		AirDensity,
-		FixedDt
+		StepTime
 	);
 
-	RigidBody.AddForce_World(LastAeroResult.TotalForce_World);
-	RigidBody.AddTorque_World(LastAeroResult.TotalTorque_World);
+	RigidBody.AddForce_World(AeroResult.TotalForce_World);
+	RigidBody.AddTorque_World(AeroResult.TotalTorque_World);
 
+	LastAeroResult = AeroResult;
+}
+
+void ASolarUAV::FixedPhysicsTick_LegacyEuler(float FixedDt)
+{
+	ComputeAndApplyAerodynamics(FixedDt);
 	ApplyControlSurfaceForces();
 
 	FVector Gravity(0.0f, 0.0f, -GravityMagnitude);
-	RigidBody.Integrate(FixedDt, Gravity);
+
+	FRigidBodyDerivative6DOF k1 = RigidBody.ComputeDerivatives(RigidBody.GetState(), Gravity);
+	FRigidBodyState6DOF NewState = RigidBody.AdvanceState(RigidBody.GetState(), k1, FixedDt);
+	RigidBody.SetState(NewState);
 
 	SimElapsed += FixedDt;
+}
+
+void ASolarUAV::FixedPhysicsTick_RK4(float FixedDt)
+{
+	ComputeAndApplyAerodynamics(FixedDt);
+	ApplyControlSurfaceForces();
+
+	FVector Gravity(0.0f, 0.0f, -GravityMagnitude);
+	RigidBody.Integrate_RK4(FixedDt, Gravity);
+
+	SimElapsed += FixedDt;
+}
+
+void ASolarUAV::FixedPhysicsTick_AdaptiveRK4(float FrameDt)
+{
+	FVector Gravity(0.0f, 0.0f, -GravityMagnitude);
+
+	float TimeDilation = GetWorld() ? GetWorld()->GetWorldSettings()->GetEffectiveTimeDilation() : 1.0f;
+	float ShearScale = 1.0f;
+
+	if (bAutoReduceStepAtHighWindShear && CurrentWindShearMagnitude > WindShearStepReductionThreshold)
+	{
+		ShearScale = FMath::Lerp(1.0f, 0.2f,
+			(CurrentWindShearMagnitude - WindShearStepReductionThreshold) / 30.0f);
+		ShearScale = FMath::Clamp(ShearScale, 0.2f, 1.0f);
+	}
+
+	float AdaptiveMaxStep = UAV_MAX_STEP_TIME * ShearScale;
+
+	ComputeAndApplyAerodynamics(FrameDt * 0.5f);
+	ApplyControlSurfaceForces();
+
+	float StepTime = FrameDt;
+	RigidBody.Integrate_AdaptiveRK4(StepTime, Gravity);
+
+	SimElapsed += StepTime;
 }
 
 void ASolarUAV::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
-	if (!bInitialized) return;
+	if (!bInitialized || bEmergencyStopped) return;
+
+	EngineTimeDilation = GetWorld() ? GetWorld()->GetWorldSettings()->GetEffectiveTimeDilation() : 1.0f;
 
 	WindField.UpdateField(SimElapsed, DeltaSeconds);
 
-	PhysicsAccumulator += DeltaSeconds;
+	FVector UAVWorldPos = RigidBody.GetWorldPosition();
+	CurrentWindVelocity  = WindField.SampleWindVelocity(UAVWorldPos);
+	CurrentWindShear     = WindField.SampleWindShear(UAVWorldPos);
+	CurrentWindShearMagnitude = CurrentWindShear.Size();
 
-	int32 MaxSubsteps = FMath::CeilToInt(DeltaSeconds / FixedPhysicsStep);
-	MaxSubsteps = FMath::Min(MaxSubsteps, 50);
+	SubStepsThisFrame = 0;
+	RejectedStepsThisFrame = 0;
 
-	int32 Steps = 0;
-	while (PhysicsAccumulator >= FixedPhysicsStep && Steps < MaxSubsteps)
+	if (IntegratorMode == EUAVIntegratorMode::RK4_Adaptive)
 	{
-		FixedPhysicsTick(FixedPhysicsStep);
-		PhysicsAccumulator -= FixedPhysicsStep;
-		Steps++;
+		FixedPhysicsTick_AdaptiveRK4(DeltaSeconds);
+	}
+	else if (IntegratorMode == EUAVIntegratorMode::RK4_FixedStep)
+	{
+		PhysicsAccumulator += DeltaSeconds;
+
+		int32 MaxSubsteps = FMath::CeilToInt(DeltaSeconds / FixedPhysicsStep);
+		MaxSubsteps = FMath::Min(MaxSubsteps, 200);
+
+		int32 Steps = 0;
+		while (PhysicsAccumulator >= FixedPhysicsStep && Steps < MaxSubsteps)
+		{
+			FixedPhysicsTick_RK4(FixedPhysicsStep);
+			PhysicsAccumulator -= FixedPhysicsStep;
+			Steps++;
+			SubStepsThisFrame = Steps;
+		}
+	}
+	else
+	{
+		PhysicsAccumulator += DeltaSeconds;
+
+		int32 MaxSubsteps = FMath::CeilToInt(DeltaSeconds / FixedPhysicsStep);
+		MaxSubsteps = FMath::Min(MaxSubsteps, 200);
+
+		int32 Steps = 0;
+		while (PhysicsAccumulator >= FixedPhysicsStep && Steps < MaxSubsteps)
+		{
+			FixedPhysicsTick_LegacyEuler(FixedPhysicsStep);
+			PhysicsAccumulator -= FixedPhysicsStep;
+			Steps++;
+			SubStepsThisFrame = Steps;
+		}
 	}
 
 	if (PhysicsAccumulator > FixedPhysicsStep * 2.0f)
@@ -157,12 +244,20 @@ void ASolarUAV::Tick(float DeltaSeconds)
 		PhysicsAccumulator = 0.0f;
 	}
 
+	FIntegrationStats Stats = RigidBody.GetIntegrationStats();
+	SubStepsThisFrame = FMath::Max(SubStepsThisFrame, Stats.SubStepsTaken);
+	RejectedStepsThisFrame = Stats.RejectedSteps;
+	LastTruncationError = Stats.LastErrorEstimate;
+	CurrentAdaptiveStepSize = Stats.CurrentStepSize;
+	EffectivePhysicsStep = CurrentAdaptiveStepSize;
+
 	FVector NewPos = RigidBody.GetWorldPosition();
 	FQuat   NewQuat = RigidBody.GetWorldOrientation();
 
 	SetActorLocationAndRotation(NewPos, NewQuat);
 
 	UpdateTelemetry();
+	UpdateSystemHealth();
 
 	if (bDrawDebugForces) DrawDebugVisualization();
 	if (bDrawDebugWind) DrawWindFieldVisualization();
@@ -183,8 +278,83 @@ void ASolarUAV::UpdateTelemetry()
 	CurrentCL            = AeroSolver.GetLiftCoefficient();
 	CurrentCD            = AeroSolver.GetDragCoefficient();
 	CurrentWindShear     = WindField.SampleWindShear(RigidBody.GetWorldPosition());
+	CurrentWindShearMagnitude = CurrentWindShear.Size();
 	CurrentMicroburstIntensity = WindField.GetMicroburstIntensityAtTime(SimElapsed);
 	CurrentFlutterAmplitude = AeroSolver.GetFlutterAmplitude();
+
+	TotalEmergencyRecoveries = RigidBody.GetTotalEmergencyRecoveries();
+	TotalAeroEmergencyClamps = AeroSolver.GetTotalEmergencyClamps();
+}
+
+void ASolarUAV::UpdateSystemHealth()
+{
+	EIntegratorHealth BodyHealth = RigidBody.GetHealthStatus();
+	EAeroSolverHealth AeroHealth = AeroSolver.GetHealth();
+
+	EUAVSystemHealth NewHealth = EUAVSystemHealth::Healthy;
+
+	if (BodyHealth == EIntegratorHealth::EmergencyStop ||
+		AeroHealth == EAeroSolverHealth::EmergencyClamped)
+	{
+		NewHealth = EUAVSystemHealth::EmergencyStop;
+		LastHealthMessage = TEXT("EMERGENCY STOP: Numerical instability detected");
+	}
+	else if (BodyHealth == EIntegratorHealth::StateRecovered)
+	{
+		NewHealth = EUAVSystemHealth::StateRecovery;
+		ConsecutiveRecoveries++;
+		LastHealthMessage = FString::Printf(TEXT("STATE RECOVERY #%d: Rolled back to last valid state"),
+			TotalEmergencyRecoveries);
+	}
+	else if (AeroHealth >= EAeroSolverHealth::OutputClamped)
+	{
+		NewHealth = EUAVSystemHealth::NumericClamping;
+		LastHealthMessage = TEXT("NUMERIC CLAMPING: Aerodynamic values exceeded safe bounds");
+	}
+	else if (BodyHealth == EIntegratorHealth::Warning || AeroHealth >= EAeroSolverHealth::InputClamped)
+	{
+		NewHealth = EUAVSystemHealth::NumericClamping;
+		LastHealthMessage = TEXT("NUMERIC CLAMPING: Input values were clamped");
+	}
+	else
+	{
+		NewHealth = EUAVSystemHealth::Healthy;
+		if (ConsecutiveRecoveries > 0)
+		{
+			ConsecutiveRecoveries = 0;
+		}
+		if (SystemHealth != EUAVSystemHealth::Healthy)
+		{
+			LastHealthMessage = TEXT("HEALTHY: System recovered to nominal operation");
+		}
+	}
+
+	if (bEnableEmergencyStop && ConsecutiveRecoveries >= MaxConsecutiveRecoveries)
+	{
+		NewHealth = EUAVSystemHealth::EmergencyStop;
+		bEmergencyStopped = true;
+		LastHealthMessage = FString::Printf(TEXT("EMERGENCY STOP: %d consecutive state recoveries exceeded limit %d"),
+			ConsecutiveRecoveries, MaxConsecutiveRecoveries);
+	}
+
+	if (CurrentAirspeed > MaxSafeAirspeed && NewHealth < EUAVSystemHealth::SystemUnstable)
+	{
+		NewHealth = EUAVSystemHealth::SystemUnstable;
+		LastHealthMessage = FString::Printf(TEXT("UNSTABLE: Airspeed %.1f m/s exceeds max safe %.1f m/s"),
+			CurrentAirspeed, MaxSafeAirspeed);
+	}
+
+	SystemHealth = NewHealth;
+
+	if (GEngine && SystemHealth >= EUAVSystemHealth::NumericClamping)
+	{
+		FColor MsgColor = FColor::Green;
+		if (SystemHealth == EUAVSystemHealth::StateRecovery) MsgColor = FColor::Yellow;
+		else if (SystemHealth >= EUAVSystemHealth::SystemUnstable) MsgColor = FColor::Red;
+
+		GEngine->AddOnScreenDebugMessage(-1, 0.1f, MsgColor,
+			FString::Printf(TEXT("[UAV HEALTH] %s"), *LastHealthMessage));
+	}
 }
 
 void ASolarUAV::DrawDebugVisualization()
@@ -222,6 +392,23 @@ void ASolarUAV::DrawDebugVisualization()
 	{
 		DrawDebugLine(GetWorld(), Pos, Pos + AirspeedDir * 60.0f,
 			FColor::Orange, false, 0.0f, 0, 2.0f);
+	}
+
+	if (SystemHealth >= EUAVSystemHealth::StateRecovery)
+	{
+		DrawDebugSphere(GetWorld(), Pos, 30.0f, 12,
+			SystemHealth >= EUAVSystemHealth::EmergencyStop ? FColor::Red : FColor::Yellow,
+			false, 0.0f, 0, 3.0f);
+	}
+
+	if (bDrawDebugSubstepMarkers && SubStepsThisFrame > 5)
+	{
+		FColor SubstepColor = SubStepsThisFrame > 50 ? FColor::Red :
+			SubStepsThisFrame > 20 ? FColor::Yellow : FColor::Green;
+		DrawDebugString(GetWorld(), Pos + FVector(0, 0, 50),
+			FString::Printf(TEXT("Substeps: %d | Rejected: %d | Err: %.2e"),
+				SubStepsThisFrame, RejectedStepsThisFrame, LastTruncationError),
+			nullptr, SubstepColor, 0.0f, true, 1.0f);
 	}
 }
 
@@ -269,9 +456,36 @@ void ASolarUAV::DrawWindFieldVisualization()
 void ASolarUAV::ResetToInitial(FVector Position, FRotator Orientation)
 {
 	RigidBody.SetInitialState(Position, Orientation.Quaternion());
+	AeroSolver.Initialize(AircraftConfig);
 	SimElapsed = 0.0f;
 	PhysicsAccumulator = 0.0f;
+	bEmergencyStopped = false;
+	ConsecutiveRecoveries = 0;
+	SystemHealth = EUAVSystemHealth::Healthy;
+	LastHealthMessage = TEXT("System reset");
 	SetActorLocationAndRotation(Position, Orientation);
+}
+
+void ASolarUAV::ResetSystemHealth()
+{
+	SystemHealth = EUAVSystemHealth::Healthy;
+	ConsecutiveRecoveries = 0;
+	bEmergencyStopped = false;
+	AeroSolver.ResetHealth();
+	RigidBody.ResetIntegrationStats();
+	LastHealthMessage = TEXT("Health counters reset");
+}
+
+void ASolarUAV::EmergencyStop()
+{
+	bEmergencyStopped = true;
+	SystemHealth = EUAVSystemHealth::EmergencyStop;
+	LastHealthMessage = TEXT("MANUAL EMERGENCY STOP");
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red,
+			TEXT("[UAV] EMERGENCY STOP ACTIVATED"));
+	}
 }
 
 void ASolarUAV::TriggerMicroburst(FVector Center, float Intensity)
@@ -301,7 +515,6 @@ void ASolarUAV::SetupPlayerInputComponent(UInputComponent* Pic)
 	UEnhancedInputComponent* Eic = Cast<UEnhancedInputComponent>(Pic);
 	if (Eic)
 	{
-		// Enhanced Input bindings would be set here via Input Actions/Contexts
 	}
 }
 
